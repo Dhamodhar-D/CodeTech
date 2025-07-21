@@ -1,0 +1,256 @@
+// Directory Structure
+// - client
+//   - public
+//     - index.html
+//   - src
+//     - App.jsx
+//     - Editor.jsx
+//     - index.js
+//     - styles.css
+// - server
+//   - server.js
+//   - models
+//     - Document.js
+//   - .env
+//   - package.json
+
+// === server/server.js ===
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const http = require('http');
+const { Server } = require('socket.io');
+require('dotenv').config();
+
+const Document = require('./models/Document');
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+app.use(cors());
+app.use(express.json());
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('MongoDB Connected'))
+  .catch(err => console.error(err));
+
+app.get('/', (req, res) => res.send('Server is running'));
+
+const defaultValue = '';
+
+io.on('connection', socket => {
+  socket.on('get-document', async documentId => {
+    const document = await findOrCreateDocument(documentId);
+    socket.join(documentId);
+    socket.emit('load-document', document.data);
+
+    socket.on('send-changes', delta => {
+      socket.broadcast.to(documentId).emit('receive-changes', delta);
+    });
+
+    socket.on('save-document', async data => {
+      await Document.findByIdAndUpdate(documentId, { data });
+    });
+  });
+});
+
+async function findOrCreateDocument(id) {
+  if (!id) return;
+  const document = await Document.findById(id);
+  if (document) return document;
+  return await Document.create({ _id: id, data: defaultValue });
+}
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// === server/models/Document.js ===
+const { Schema, model } = require('mongoose');
+
+const DocumentSchema = new Schema({
+  _id: String,
+  data: Object
+});
+
+module.exports = model('Document', DocumentSchema);
+
+// === server/.env ===
+MONGO_URI=mongodb://localhost:27017/collab-editor
+PORT=5000
+
+// === client/public/index.html ===
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Collaborative Editor</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="root"></div>
+</body>
+</html>
+
+// === client/src/index.js ===
+import React from 'react';
+import ReactDOM from 'react-dom';
+import App from './App';
+import './styles.css';
+
+ReactDOM.render(<App />, document.getElementById('root'));
+
+// === client/src/App.jsx ===
+import React from 'react';
+import { v4 as uuidV4 } from 'uuid';
+import { useNavigate } from 'react-router-dom';
+
+const App = () => {
+  const navigate = useNavigate();
+
+  const createDoc = () => {
+    const id = uuidV4();
+    navigate(`/documents/${id}`);
+  };
+
+  return (
+    <div className="home-container">
+      <h1>Welcome to Collaborative Editor</h1>
+      <button onClick={createDoc}>Create New Document</button>
+    </div>
+  );
+};
+
+export default App;
+
+// === client/src/Editor.jsx ===
+import React, { useEffect, useCallback, useState } from 'react';
+import Quill from 'quill';
+import 'quill/dist/quill.snow.css';
+import { useParams } from 'react-router-dom';
+import { io } from 'socket.io-client';
+
+const SAVE_INTERVAL_MS = 2000;
+
+const Editor = () => {
+  const { id: documentId } = useParams();
+  const [socket, setSocket] = useState();
+  const [quill, setQuill] = useState();
+
+  useEffect(() => {
+    const s = io('http://localhost:5000');
+    setSocket(s);
+    return () => s.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (socket == null || quill == null) return;
+
+    socket.once('load-document', document => {
+      quill.setContents(document);
+      quill.enable();
+    });
+
+    socket.emit('get-document', documentId);
+  }, [socket, quill, documentId]);
+
+  useEffect(() => {
+    if (socket == null || quill == null) return;
+
+    const interval = setInterval(() => {
+      socket.emit('save-document', quill.getContents());
+    }, SAVE_INTERVAL_MS);
+
+    return () => clearInterval(interval);
+  }, [socket, quill]);
+
+  useEffect(() => {
+    if (socket == null || quill == null) return;
+
+    const handler = delta => {
+      quill.updateContents(delta);
+    };
+    socket.on('receive-changes', handler);
+    return () => socket.off('receive-changes', handler);
+  }, [socket, quill]);
+
+  useEffect(() => {
+    if (socket == null || quill == null) return;
+
+    const handler = (delta, oldDelta, source) => {
+      if (source !== 'user') return;
+      socket.emit('send-changes', delta);
+    };
+    quill.on('text-change', handler);
+    return () => quill.off('text-change', handler);
+  }, [socket, quill]);
+
+  const wrapperRef = useCallback(wrapper => {
+    if (wrapper == null) return;
+
+    wrapper.innerHTML = '';
+    const editor = document.createElement('div');
+    wrapper.append(editor);
+    const q = new Quill(editor, { theme: 'snow' });
+    q.disable();
+    q.setText('Loading...');
+    setQuill(q);
+  }, []);
+
+  return <div className="editor-container" ref={wrapperRef}></div>;
+};
+
+export default Editor;
+
+// === client/src/styles.css ===
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  background: #f0f2f5;
+}
+
+.home-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  gap: 20px;
+}
+
+button {
+  padding: 10px 20px;
+  font-size: 16px;
+  border: none;
+  background-color: #007bff;
+  color: white;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.editor-container {
+  height: 100vh;
+}
+
+// === client/package.json dependencies ===
+// Run these commands inside /client to set up:
+// npm install react react-dom react-router-dom quill socket.io-client uuid
+
+// === client/src/router setup ===
+// Create client/src/main.jsx if using Vite or modify index.js for CRA
+// Example using React Router:
+import React from 'react';
+import { BrowserRouter, Routes, Route } from 'react-router-dom';
+import ReactDOM from 'react-dom';
+import App from './App';
+import Editor from './Editor';
+
+ReactDOM.render(
+  <BrowserRouter>
+    <Routes>
+      <Route path="/" element={<App />} />
+      <Route path="/documents/:id" element={<Editor />} />
+    </Routes>
+  </BrowserRouter>,
+  document.getElementById('root')
+);
